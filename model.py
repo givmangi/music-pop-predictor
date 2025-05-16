@@ -4,20 +4,19 @@ import torch.optim as optim
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, RobustScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, RobustScaler, MinMaxScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from torch.utils.data import DataLoader, TensorDataset # Added
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-
-# --- Configuration ---
-BATCH_SIZE = 512 # prima batchnorm, sperimentabile
+BATCH_SIZE = 256 # prima batchnorm, sperimentabile
 TARGET_COLUMN_NAME = 'track_popularity'
 CSV_FILE_PATH = 'kaggle_data/spotify_songs.csv'
 
-# --- Model Definition ---
 def define_model(input_size, device):
     hidden1_size = 128 #provo non overfittare
     hidden2_size = 64 #sperimento con valori più alti
@@ -82,7 +81,7 @@ def load_and_preprocess_data(csv_path, target_column_name):
         'track_album_id', 'track_album_name',
         'release_year'
     ]
-    # Handle Date Feature
+    # gestione data
     if 'track_album_release_date' in df.columns:
         try:
             df['track_album_release_date'] = pd.to_datetime(df['track_album_release_date'], errors='coerce')
@@ -100,17 +99,18 @@ def load_and_preprocess_data(csv_path, target_column_name):
             if 'track_album_release_date' not in features_to_drop:
                  features_to_drop.append('track_album_release_date')
 
-
-
     y_raw = df[target_column_name].copy()
     X_raw = df.drop(columns=[target_column_name] + features_to_drop, errors='ignore').copy()
+    # Sperimento con manipolazione dati
+    X_raw['acousticness_minus_instrumentalness'] = X_raw['acousticness'] - X_raw['instrumentalness']
+
 
     numerical_features = X_raw.select_dtypes(include=np.number).columns.tolist()
     categorical_features = X_raw.select_dtypes(include='object').columns.tolist()
 
     potential_cats_numeric = ['key', 'mode']
     for p_cat in potential_cats_numeric:
-        if p_cat in X_raw.columns: # Check ix exist
+        if p_cat in X_raw.columns: # Check if exist
             if p_cat in numerical_features:
                 numerical_features.remove(p_cat)
                 categorical_features.append(p_cat)
@@ -120,12 +120,7 @@ def load_and_preprocess_data(csv_path, target_column_name):
     current_X_cols = X_raw.columns.tolist()
     numerical_features = [f for f in numerical_features if f in current_X_cols]
     categorical_features = [f for f in categorical_features if f in current_X_cols]
-
-    print(f"Final Numerical features for X: {numerical_features}")
-    print(f"Final Categorical features for X: {categorical_features}")
     print(f"Number of X features: {len(numerical_features) + len(categorical_features)}")
-
-
     X_train_val_raw, X_test_raw, y_train_val_raw, y_test_raw = train_test_split(
         X_raw, y_raw, test_size=0.15, random_state=42
     )
@@ -138,15 +133,31 @@ def load_and_preprocess_data(csv_path, target_column_name):
 
     numerical_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
-        #too sensible to outliers ('scaler', StandardScaler())])
-        ('scaler', RobustScaler())])
+        #('scaler', StandardScaler())])
+        #('scaler', RobustScaler())])
+        ('scaler', MinMaxScaler())]) #provo a vedere se migliora
     categorical_transformer_X = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='most_frequent')),
         ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))])
 
-    print(f"Unique playlist_genre values: {X_raw['playlist_genre'].nunique()}")
-    #print(f"Unique playlist_subgenre values: {X_raw['playlist_subgenre'].nunique()}")
+    # print(f"Unique playlist_genre values: {X_raw['playlist_genre'].nunique()}")
+    # print(f"Unique playlist_subgenre values: {X_raw['playlist_subgenre'].nunique()}")
     print(f"numerical features: {numerical_features}, \n categorical features: {categorical_features}")
+
+    #corr matrix
+    corr_matrix = df.corr(numeric_only=True)
+    print("\nCorrelation matrix:")
+    print(corr_matrix[target_column_name].sort_values(ascending=False))
+    for cat in categorical_features:
+        print(f"\n '{target_column_name}' median per Cat. sFeature '{cat}':")
+        print(df.groupby(cat)[target_column_name].mean().sort_values(ascending=False))
+    #heatmap
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="Purples", square=True)
+    plt.title("Numerical Feature Correlation Matrix")
+    plt.tight_layout()
+    plt.show()
+    
     preprocessor_X = ColumnTransformer(transformers=[
             ('num', numerical_transformer, numerical_features),
             ('cat', categorical_transformer_X, categorical_features)],
@@ -268,6 +279,7 @@ def main():
     patience = 10 #abbasso visto il plateau drammatico 
     min_delta = 0.0006 
     weight_decay = 0.0001 #regolarizzazione L2 
+
     print("1. Loading and Preprocessing Data...")
     train_input, train_target, val_input, val_target, test_input, test_target, input_size, y_scaler = \
         load_and_preprocess_data(CSV_FILE_PATH, TARGET_COLUMN_NAME)
@@ -280,7 +292,6 @@ def main():
     num_workers=0
     pin_memory = True if device.type == 'cuda' else False
     print(f"Using DataLoader with num_workers={num_workers}, pin_memory={pin_memory}")
-
 
     #proviamo dataLoading
     train_dataset = TensorDataset(train_input, train_target)
@@ -300,11 +311,9 @@ def main():
     model = define_model(input_size, device)
     print(model)
 
-    # Loss +  Adam try
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay) #aggiunta regolarizzazione per overfitting
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay) #aggiunta regolarizzazione per overfitting  
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=4, factor=0.5, min_lr=1e-6) #lrScheduling per il meme
-
 
     print("\n3. Starting Training with Early Stopping...")
 
@@ -340,7 +349,7 @@ def main():
                 print(f"\nEarly stopping triggered at epoch {epoch+1} due to no improvement in validation loss for {patience} epochs.")
                 if best_model_state:
                     model.load_state_dict(best_model_state)
-                    print(f"   Loaded model state from epoch {best_epoch} (best validation loss).")
+                    print(f"\tLoaded model state from epoch {best_epoch} (best validation loss).")
                 break 
     if epochs_no_improve < patience and best_model_state:
          model.load_state_dict(best_model_state)
@@ -349,27 +358,27 @@ def main():
          print("\nTraining finished, but no model state was saved (validation loss never decreased). Using final epoch model state.")
 
 
-    print("\n4. Training Finished!")
+    print("\n4.\tTraining Finished!")
 
-    print("\n5. Evaluating on Full Test Set (Metrics on Original Scale)...")
+    print("\n5.\tEvaluating on Full Test Set (Metrics on Original Scale)...")
     
     #commento per nobatch final_test_loss, final_test_mae_orig, final_test_rmse_orig = evaluate_model(model, test_input, test_target, criterion, y_scaler)
     #batchversion
     final_test_loss, final_test_mae_orig, final_test_rmse_orig = evaluate_model(model, test_loader, criterion, y_scaler, device)
-    print(f'   Final Test Loss (MSE SCALED): {final_test_loss:.4f}')
-    print(f'   Final Test MAE (Original): {final_test_mae_orig:.2f}')
-    print(f'   Final Test RMSE (Original): {final_test_rmse_orig:.2f}')
+    print(f'\tFinal Test Loss (MSE SCALED): {final_test_loss:.4f}')
+    print(f'\tFinal Test MAE (Original): {final_test_mae_orig:.2f}')
+    print(f'\tFinal Test RMSE (Original): {final_test_rmse_orig:.2f}')
 
 
-    print("\n6. Saving Model...")
+    print("\n6.\tSaving Model...")
     try:
         #nobatch torch.save(model.state_dict(), 'music_regressor_model_best_val.pth') # Changed filename to indicate best val
         #batchversion
         torch.save(model.state_dict(), 'music_regressor_model_best_val_batch.pth') # Changed filename to indicate best val
 
-        print("   Best model state saved to music_regressor_model_best_val_batch.pth")
+        print("\tBest model state saved to music_regressor_model_best_val_batch.pth")
     except Exception as e:
-        print(f"   Error saving model: {e}")
+        print(f"\tError saving model: {e}")
 
 if __name__ == "__main__":
     main()
